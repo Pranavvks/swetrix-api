@@ -1,12 +1,14 @@
 import { ClickHouse } from 'clickhouse'
 import Redis from 'ioredis'
+import * as path from 'path'
 import { hash } from 'blake3'
 import * as _toNumber from 'lodash/toNumber'
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 require('dotenv').config()
 
-const { CLICKHOUSE_DATABASE } = process.env
+const { CLICKHOUSE_DATABASE, PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET } =
+  process.env
 
 const redis = new Redis(
   _toNumber(process.env.REDIS_PORT),
@@ -71,7 +73,7 @@ const getRedisCaptchaKey = (token: string) => `captcha_${hash(token)}`
 const REDIS_LOG_DATA_CACHE_KEY = 'log_cache'
 const REDIS_LOG_CAPTCHA_CACHE_KEY = 'log:captcha'
 const REDIS_LOG_PERF_CACHE_KEY = 'perf_cache'
-const REDIS_LOG_CUSTOM_CACHE_KEY = 'log_custom_cache_v2'
+const REDIS_LOG_CUSTOM_CACHE_KEY = 'log_custom_cache_v3'
 const REDIS_SESSION_SALT_KEY = 'log_salt' // is updated every 24 hours
 const REDIS_USERS_COUNT_KEY = 'stats:users_count'
 const REDIS_PROJECTS_COUNT_KEY = 'stats:projects_count'
@@ -109,6 +111,14 @@ const CAPTCHA_COOKIE_KEY = 'swetrix-captcha-token'
 const CAPTCHA_TOKEN_LIFETIME = 300 // seconds (5 minutes).
 const CAPTCHA_SECRET_KEY_LENGTH = 50
 
+// Funnels
+const MIN_PAGES_IN_FUNNEL = 2
+const MAX_PAGES_IN_FUNNEL = 10
+
+const BLOG_POSTS_PATH = isDevelopment
+  ? path.join(__dirname, '../../../..', 'blog-posts', 'posts')
+  : path.join(__dirname, '../..', 'blog-posts', 'posts')
+
 const TRAFFIC_COLUMNS = [
   'cc',
   'rg',
@@ -123,6 +133,8 @@ const TRAFFIC_COLUMNS = [
   'me',
   'ca',
 ]
+
+const ALL_COLUMNS = [...TRAFFIC_COLUMNS, 'ev']
 
 const CAPTCHA_COLUMNS = ['cc', 'br', 'os', 'dv']
 const PERFORMANCE_COLUMNS = ['cc', 'rg', 'ct', 'pg', 'dv', 'br']
@@ -163,6 +175,8 @@ const sentryIgnoreErrors: (string | RegExp)[] = [
 
 const NUMBER_JWT_REFRESH_TOKEN_LIFETIME = Number(JWT_REFRESH_TOKEN_LIFETIME)
 const NUMBER_JWT_ACCESS_TOKEN_LIFETIME = Number(JWT_ACCESS_TOKEN_LIFETIME)
+
+const MAX_FUNNELS = 100
 
 export {
   clickhouse,
@@ -207,4 +221,11 @@ export {
   PERFORMANCE_COLUMNS,
   sentryIgnoreErrors,
   isProxiedByCloudflare,
+  PAYPAL_CLIENT_ID,
+  PAYPAL_CLIENT_SECRET,
+  BLOG_POSTS_PATH,
+  MIN_PAGES_IN_FUNNEL,
+  MAX_PAGES_IN_FUNNEL,
+  MAX_FUNNELS,
+  ALL_COLUMNS,
 }

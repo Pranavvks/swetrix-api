@@ -1,5 +1,7 @@
+import * as crypto from 'crypto'
 import * as _isEmpty from 'lodash/isEmpty'
 import * as _split from 'lodash/split'
+import * as _reverse from 'lodash/reverse'
 import * as _size from 'lodash/size'
 import * as _includes from 'lodash/includes'
 import * as _map from 'lodash/map'
@@ -12,6 +14,7 @@ import * as _last from 'lodash/last'
 import * as _some from 'lodash/some'
 import * as _find from 'lodash/find'
 import * as _now from 'lodash/now'
+import * as _isString from 'lodash/isString'
 import * as _values from 'lodash/values'
 import * as _round from 'lodash/round'
 import * as _filter from 'lodash/filter'
@@ -44,8 +47,11 @@ import {
   clickhouse,
   REDIS_SESSION_SALT_KEY,
   TRAFFIC_COLUMNS,
+  ALL_COLUMNS,
   CAPTCHA_COLUMNS,
   PERFORMANCE_COLUMNS,
+  MIN_PAGES_IN_FUNNEL,
+  MAX_PAGES_IN_FUNNEL,
 } from '../common/constants'
 import {
   calculateRelativePercentage,
@@ -55,7 +61,8 @@ import { PageviewsDTO } from './dto/pageviews.dto'
 import { EventsDTO } from './dto/events.dto'
 import { ProjectService } from '../project/project.service'
 import { Project } from '../project/entity/project.entity'
-import { TimeBucketType } from './dto/getData.dto'
+import { ChartRenderMode, TimeBucketType } from './dto/getData.dto'
+import { GetCustomEventMetadata } from './dto/get-custom-event-meta.dto'
 import {
   PerformanceCHResponse,
   CustomsCHResponse,
@@ -70,6 +77,9 @@ import {
   IBuildUserFlow,
   IExtractChartData,
   IGenerateXAxis,
+  IAggregatedMetadata,
+  IFunnelCHResponse,
+  IFunnel,
 } from './interfaces'
 
 dayjs.extend(utc)
@@ -652,6 +662,60 @@ export class AnalyticsService {
     }
   }
 
+  async getPagesArray(
+    rawPages?: string,
+    funnelId?: string,
+    projectId?: string,
+  ): Promise<string[]> {
+    if (funnelId && projectId) {
+      const funnel = await this.projectService.getFunnel(funnelId, projectId)
+
+      if (!funnel || _isEmpty(funnel)) {
+        throw new UnprocessableEntityException(
+          'The provided funnelId is incorrect',
+        )
+      }
+
+      return funnel.steps
+    }
+
+    try {
+      const pages = JSON.parse(rawPages)
+
+      if (!_isArray(pages)) {
+        throw new UnprocessableEntityException(
+          'An array of pages has to be provided as a pages param',
+        )
+      }
+
+      const size = _size(pages)
+
+      if (size < MIN_PAGES_IN_FUNNEL) {
+        throw new UnprocessableEntityException(
+          `A minimum of ${MIN_PAGES_IN_FUNNEL} pages or events has to be provided`,
+        )
+      }
+
+      if (size > MAX_PAGES_IN_FUNNEL) {
+        throw new UnprocessableEntityException(
+          `A maximum of ${MAX_PAGES_IN_FUNNEL} pages or events can be provided`,
+        )
+      }
+
+      if (_some(pages, page => !_isString(page))) {
+        throw new UnprocessableEntityException(
+          'Pages array must contain string values only',
+        )
+      }
+
+      return pages
+    } catch (e) {
+      throw new UnprocessableEntityException(
+        'Cannot process the provided array of pages',
+      )
+    }
+  }
+
   async getTimeBucketForAllTime(
     pid: string,
     period: string,
@@ -830,10 +894,192 @@ export class AnalyticsService {
     }
   }
 
-  async isUnique(sessionHash: string) {
-    const session = await redis.get(sessionHash)
-    await redis.set(sessionHash, 1, 'EX', UNIQUE_SESSION_LIFE_TIME)
-    return !session
+  generateUInt64(): string {
+    return crypto.randomBytes(8).readBigUInt64BE(0).toString()
+  }
+
+  /**
+   * Checks if the session is unique and returns the session psid (or creates a new one)
+   * @param sessionHash
+   * @returns [isUnique, psid]
+   */
+  async isUnique(sessionHash: string): Promise<[boolean, string]> {
+    let psid = await redis.get(sessionHash)
+    const exists = Boolean(psid)
+
+    if (!exists) {
+      psid = this.generateUInt64()
+    }
+
+    await redis.set(sessionHash, psid, 'EX', UNIQUE_SESSION_LIFE_TIME)
+    return [!exists, psid]
+  }
+
+  formatFunnel(data: IFunnelCHResponse[], pages: string[]): IFunnel[] {
+    const funnel = _map(data, (row, index) => {
+      const value = pages[index]
+
+      let events = row.c
+      let dropoff = 0
+      let eventsPerc = 100
+      let eventsPercStep = 100
+      let dropoffPercStep = 0
+
+      if (index > 0) {
+        const prev = data[index - 1]
+        events = row.c
+        dropoff = prev.c - row.c
+        eventsPerc = _round((row.c / data[0].c) * 100, 2)
+        eventsPercStep = _round((row.c / prev.c) * 100, 2)
+        dropoffPercStep = _round((dropoff / prev.c) * 100, 2)
+      }
+
+      return {
+        value,
+        events,
+        eventsPerc,
+        eventsPercStep,
+        dropoff,
+        dropoffPercStep,
+      }
+    })
+
+    return funnel
+  }
+
+  /*
+    ClickHouse's windowFunnel() function returns steps that have non-zero counts.
+    I.e. if we have data like [{level: 1, c: 100}, {level: 3, c: 50}],
+    it means that level 2 should be 50 as well (because 50 users got up to level 3).
+
+    This function backfills missing levels with previous count.
+  */
+  backfillFunnel(
+    data: IFunnelCHResponse[],
+    pages: string[],
+  ): IFunnelCHResponse[] {
+    // Get max level
+    const maxLevel = _size(pages)
+
+    // Build map of level -> count
+    const levelCounts = new Map()
+    for (const d of data) {
+      levelCounts.set(d.level, d.c)
+    }
+
+    let prevCount = 0
+
+    // Backfill missing levels with previous count
+    const filled = []
+    for (let level = maxLevel; level >= 1; level--) {
+      const count = levelCounts.get(level)
+      if (count !== undefined) {
+        prevCount += count
+      }
+
+      filled.push({
+        level,
+        c: prevCount,
+      })
+    }
+
+    return filled
+  }
+
+  generateEmptyFunnel(pages: string[]): IFunnel[] {
+    return _map(pages, value => ({
+      value,
+      events: 0,
+      eventsPerc: 0,
+      eventsPercStep: 0,
+      dropoff: 0,
+      dropoffPerc: 0,
+    }))
+  }
+
+  async getFunnel(pages: string[], params: any): Promise<IFunnel[]> {
+    const pageParams = {}
+
+    const pagesStr = _join(
+      _map(pages, (value, index) => {
+        pageParams[`v${index}`] = value
+
+        return `value={v${index}:String}`
+      }),
+      ',',
+    )
+
+    const query = `
+      SELECT
+        level,
+        count() as c
+      FROM (
+        SELECT
+          psid,
+          windowFunnel(86400)(created, ${pagesStr}) AS level
+        FROM (
+          SELECT
+            psid,
+            pg AS value,
+            created
+          FROM analytics
+          WHERE pid = {pid:FixedString(12)}
+          AND psid != 0
+          AND created BETWEEN {groupFrom:String} AND {groupTo:String}
+
+          UNION ALL
+
+          SELECT
+            psid,
+            ev AS value,
+            created
+          FROM customEV
+          WHERE pid = {pid:FixedString(12)}
+          AND psid != 0
+          AND created BETWEEN {groupFrom:String} AND {groupTo:String}
+        )
+        GROUP BY psid
+      )
+      WHERE level != 0
+      GROUP BY level
+      ORDER BY level DESC;
+    `
+
+    const result = <Array<IFunnelCHResponse>>(
+      await clickhouse
+        .query(query, { params: { ...params, ...pageParams } })
+        .toPromise()
+    )
+
+    if (_isEmpty(result)) {
+      return this.generateEmptyFunnel(pages)
+    }
+
+    return this.formatFunnel(
+      _reverse(this.backfillFunnel(result, pages)),
+      pages,
+    )
+  }
+
+  async getTotalPageviews(
+    pid: string,
+    groupFrom: string,
+    groupTo: string,
+  ): Promise<number> {
+    const query = `
+      SELECT
+        count() as c
+      FROM analytics
+      WHERE pid = {pid:FixedString(12)}
+      AND created BETWEEN {groupFrom:String} AND {groupTo:String}
+    `
+    const result = <{ c: number }[]>(
+      await clickhouse
+        .query(query, { params: { pid, groupFrom, groupTo } })
+        .toPromise()
+    )
+
+    return result[0]?.c || 0
   }
 
   async getSummary(
@@ -944,13 +1190,18 @@ export class AnalyticsService {
   }
 
   async getFilters(pid: string, type: string): Promise<Array<string>> {
-    if (!_includes(TRAFFIC_COLUMNS, type)) {
+    if (!_includes(ALL_COLUMNS, type)) {
       throw new UnprocessableEntityException(
         `The provided type (${type}) is incorrect`,
       )
     }
 
-    const query = `SELECT ${type} FROM analytics WHERE pid={pid:FixedString(12)} AND ${type} IS NOT NULL GROUP BY ${type}`
+    let query = `SELECT ${type} FROM analytics WHERE pid={pid:FixedString(12)} AND ${type} IS NOT NULL GROUP BY ${type}`
+
+    if (type === 'ev') {
+      query = `SELECT ${type} FROM customEV WHERE pid={pid:FixedString(12)} AND ${type} IS NOT NULL GROUP BY ${type}`
+    }
+
     const results = await clickhouse
       .query(query, { params: { pid } })
       .toPromise()
@@ -1222,13 +1473,14 @@ export class AnalyticsService {
     timeBucket: TimeBucketType,
     filtersQuery: string,
     safeTimezone: string,
+    mode: ChartRenderMode,
   ): string {
     const timeBucketFunc = timeBucketConversion[timeBucket]
     const [selector, groupBy] = this.getGroupSubquery(timeBucket)
     const tzFromDate = `toTimeZone(parseDateTimeBestEffort({groupFrom:String}), '${safeTimezone}')`
     const tzToDate = `toTimeZone(parseDateTimeBestEffort({groupTo:String}), '${safeTimezone}')`
 
-    return `
+    const baseQuery = `
       SELECT
         ${selector},
         avg(sdur) as sdur,
@@ -1245,20 +1497,33 @@ export class AnalyticsService {
       ) as subquery
       GROUP BY ${groupBy}
       ORDER BY ${groupBy}
+    `
+
+    if (mode === ChartRenderMode.CUMULATIVE) {
+      return `
+        SELECT
+          *,
+          sum(pageviews) OVER (ORDER BY ${groupBy}) as pageviews,
+          sum(uniques) OVER (ORDER BY ${groupBy}) as uniques
+        FROM (${baseQuery})
       `
+    }
+
+    return baseQuery
   }
 
   generateCustomEventsAggregationQuery(
     timeBucket: TimeBucketType,
     filtersQuery: string,
     safeTimezone: string,
+    mode: ChartRenderMode,
   ): string {
     const timeBucketFunc = timeBucketConversion[timeBucket]
     const [selector, groupBy] = this.getGroupSubquery(timeBucket)
     const tzFromDate = `toTimeZone(parseDateTimeBestEffort({groupFrom:String}), '${safeTimezone}')`
     const tzToDate = `toTimeZone(parseDateTimeBestEffort({groupTo:String}), '${safeTimezone}')`
 
-    return `
+    const baseQuery = `
       SELECT
         ${selector},
         count() as count
@@ -1273,6 +1538,17 @@ export class AnalyticsService {
       GROUP BY ${groupBy}
       ORDER BY ${groupBy}
       `
+
+    if (mode === ChartRenderMode.CUMULATIVE) {
+      return `
+          SELECT
+            *,
+            sum(count) OVER (ORDER BY ${groupBy}) as count
+          FROM (${baseQuery})
+        `
+    }
+
+    return baseQuery
   }
 
   generatePerformanceAggregationQuery(
@@ -1313,13 +1589,14 @@ export class AnalyticsService {
     timeBucket: TimeBucketType,
     filtersQuery: string,
     safeTimezone: string,
+    mode: ChartRenderMode,
   ): string {
     const timeBucketFunc = timeBucketConversion[timeBucket]
     const [selector, groupBy] = this.getGroupSubquery(timeBucket)
     const tzFromDate = `toTimeZone(parseDateTimeBestEffort({groupFrom:String}), '${safeTimezone}')`
     const tzToDate = `toTimeZone(parseDateTimeBestEffort({groupTo:String}), '${safeTimezone}')`
 
-    return `
+    const baseQuery = `
       SELECT
         ${selector},
         count() as count
@@ -1334,7 +1611,19 @@ export class AnalyticsService {
       ) as subquery
       GROUP BY ${groupBy}
       ORDER BY ${groupBy}
+    `
+
+    if (mode === ChartRenderMode.CUMULATIVE) {
+      return `
+        SELECT
+          *,
+          sum(pageviews) OVER (ORDER BY ${groupBy}) as pageviews,
+          sum(uniques) OVER (ORDER BY ${groupBy}) as uniques
+        FROM (${baseQuery})
       `
+    }
+
+    return baseQuery
   }
 
   async groupByTimeBucket(
@@ -1347,6 +1636,7 @@ export class AnalyticsService {
     safeTimezone: string,
     customEVFilterApplied: boolean,
     parsedFilters: Array<{ [key: string]: string }>,
+    mode: ChartRenderMode,
   ): Promise<object | void> {
     let params: unknown = {}
     let chart: unknown = {}
@@ -1380,6 +1670,7 @@ export class AnalyticsService {
           paramsData,
           safeTimezone,
           customEVFilterApplied,
+          mode,
         )
 
         // @ts-ignore
@@ -1424,6 +1715,7 @@ export class AnalyticsService {
     paramsData: any,
     safeTimezone: string,
     customEVFilterApplied: boolean,
+    mode: ChartRenderMode,
   ): Promise<object | void> {
     const avgSdur = customEVFilterApplied
       ? 0
@@ -1436,6 +1728,7 @@ export class AnalyticsService {
         timeBucket,
         filtersQuery,
         safeTimezone,
+        mode,
       )
 
       const result = <Array<TrafficCEFilterCHResponse>>(
@@ -1463,6 +1756,7 @@ export class AnalyticsService {
       timeBucket,
       filtersQuery,
       safeTimezone,
+      mode,
     )
 
     const result = <Array<TrafficCHResponse>>(
@@ -1508,6 +1802,7 @@ export class AnalyticsService {
     filtersQuery: string,
     paramsData: object,
     safeTimezone: string,
+    mode: ChartRenderMode,
   ): Promise<object | void> {
     let params: unknown = {}
     let chart: unknown = {}
@@ -1544,6 +1839,7 @@ export class AnalyticsService {
           timeBucket,
           filtersQuery,
           safeTimezone,
+          mode,
         )
 
         const result = <Array<TrafficCEFilterCHResponse>>(
@@ -1694,6 +1990,88 @@ export class AnalyticsService {
     }
 
     return result
+  }
+
+  validateCustomEVMeta(meta: any) {
+    if (typeof meta === 'undefined') {
+      return
+    }
+
+    if (_some(_values(meta), val => !_isString(val))) {
+      throw new UnprocessableEntityException(
+        'The provided custom event metadata is incorrect (some values are not strings)',
+      )
+    }
+  }
+
+  async getCustomEventMetadata(
+    data: GetCustomEventMetadata,
+  ): Promise<IAggregatedMetadata[]> {
+    const {
+      pid,
+      period,
+      timeBucket,
+      from,
+      to,
+      timezone = DEFAULT_TIMEZONE,
+      event,
+    } = data
+
+    let newTimebucket = timeBucket
+
+    let diff
+
+    if (period === 'all') {
+      const res = await this.getTimeBucketForAllTime(pid, period, timezone)
+
+      diff = res.diff
+      // eslint-disable-next-line prefer-destructuring
+      newTimebucket = _includes(res.timeBucket, timeBucket)
+        ? timeBucket
+        : res.timeBucket[0]
+    }
+
+    this.validateTimebucket(newTimebucket)
+
+    const safeTimezone = this.getSafeTimezone(timezone)
+    const { groupFromUTC, groupToUTC } = this.getGroupFromTo(
+      from,
+      to,
+      newTimebucket,
+      period,
+      safeTimezone,
+      diff,
+    )
+
+    const query = `SELECT 
+      meta.key AS key, 
+      meta.value AS value,
+      count() AS count
+    FROM customEV
+    ARRAY JOIN meta.key, meta.value
+    WHERE pid = {pid:FixedString(12)}
+      AND created BETWEEN {groupFrom:String} AND {groupTo:String}
+      AND ev = {event:String}
+    GROUP BY key, value`
+
+    const paramsData = {
+      params: {
+        pid,
+        groupFrom: groupFromUTC,
+        groupTo: groupToUTC,
+        event,
+      },
+    }
+
+    try {
+      const result = await clickhouse.query(query, paramsData).toPromise()
+      return result as IAggregatedMetadata[]
+    } catch (reason) {
+      console.error(`[ERROR](getCustomEventMetadata): ${reason}`)
+      throw new InternalServerErrorException(
+        'Something went wrong. Please, try again later.',
+      )
+    }
   }
 
   async getOnlineUserCount(pid: string): Promise<number> {
